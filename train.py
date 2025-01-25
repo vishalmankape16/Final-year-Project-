@@ -1,18 +1,23 @@
 import json
 import numpy as np 
 import h5py
+import json
 import torch
+import pickle
 import torch.nn as nn
 from torch.utils.data import TensorDataset
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from torchmetrics import F1
 from tqdm import tqdm
-import pickle
+from torch.autograd import Variable
+
+
+from BaseModel import build_baseline_model
 
 
 def train_model(num_of_epochs, model, loss_fn, opt, train_dl):
-    print("\t-----Training Phase Started-----")
+    print("/t-----Training Phase Started-----")
     
     train_graph = {
         "accuracy": [],
@@ -36,13 +41,15 @@ def train_model(num_of_epochs, model, loss_fn, opt, train_dl):
         actual_index = list()
         predictions_index = list()
         
-        for xb, yb in train_dl:
-            
-            xb = xb.cuda()
+        for q, v, yb in train_dl:
+            v = Variable(v, requires_grad=True).cuda()
+            q = Variable(q, requires_grad=True).cuda()
             yb = yb.cuda()
 
             # 1 forward
-            preds = model(xb)
+
+            preds = model(v, q)
+            # print(preds)
 
             # 2 compute the objective function
             loss = loss_fn(torch.squeeze(preds), torch.squeeze(yb))
@@ -57,18 +64,19 @@ def train_model(num_of_epochs, model, loss_fn, opt, train_dl):
             opt.step()
 
             for i in range(len(preds)):
-                predictions.append(np.array(preds[i][0].detach().cpu(), dtype = np.float64))
-                actual.append(np.array(yb[i][0].cpu(), dtype = np.int32))
+                predictions.append(np.array(preds[i].detach().cpu(), dtype = np.float64))
+                actual.append(np.array(yb[i].cpu(), dtype = np.int32))
 
-                predictions_index.append(torch.argmax(preds[i][0]))
-                actual_index.append(torch.argmax(yb[i][0]))
+                predictions_index.append(torch.argmax(preds[i]))
+                actual_index.append(torch.argmax(yb[i]))
 
              # training step accuracy
             batch_acc = train_accuracy(torch.tensor(predictions_index), torch.tensor(actual_index))
 
             losses.append(loss.item())
 
-        f1_score = f1(torch.tensor(predictions), torch.tensor(actual))
+        # print(predictions, len(actual))
+        f1_score = f1(torch.tensor(np.array(predictions)), torch.tensor(np.array(actual)))
         
         total_train_accuracy = train_accuracy.compute()
 
@@ -85,66 +93,62 @@ def train_model(num_of_epochs, model, loss_fn, opt, train_dl):
     return train_graph
 
 
-def train_fc_layer(train_core_hdf5, embeddings_file, train_annotations_file):
+def train_fc_layer(image_hdf5, question_hdf5, embeddings_file, train_annotations_file):
     
     # instantiate the model
-    model = nn.Sequential(
-        nn.Linear(384, 3000),
-        nn.Softmax(dim=2)
-    ).cuda()
+    model = build_baseline_model()
 
     # print model architecture
     print(model.parameters)
 
+    # Frequent Embeddings
     freq_ans_file = open(embeddings_file)
     freq_ans_data = json.load(freq_ans_file)
     freq_ans_file.close()
 
-    mapping_file = open('non_frequent_mapping_qid', 'rb')
-    mapping_data = pickle.load(mapping_file)
+    # Answer Maping
+    json_file = open(train_annotations_file, 'rb')
+    data = pickle.load(json_file)
 
-    ## Training
-    train_ans_file = open(train_annotations_file)
-    train_ans_data = json.load(train_ans_file)
-    train_ans_file.close()
 
-    train_inputs = []
-    train_outputs = []
+    train_questions = []
+    train_images = []
+    train_labels = []
     
-    print("\t-----Constructing Training Input Output Datasets-----")
+    print("/t-----Constructing Training Input Output Datasets-----")
 
-    with h5py.File(train_core_hdf5, 'r') as core_file:
-        ques_ids = list(core_file.keys())
+    with h5py.File(question_hdf5, 'r') as ques_file, h5py.File(image_hdf5, 'r') as img_file:
+        ques_ids = list(ques_file.keys())
         for r in tqdm(range(len(ques_ids))):
-            i = ques_ids[r]
-            train_inputs.append(np.array(core_file[i], dtype = np.float32))
-
-            ans_arr = [[int(x) for x in freq_ans_data[mapping_data[int(i)]]]]
-            train_outputs.append(np.array(ans_arr, dtype = np.float32))
+            # question
+            q_id = ques_ids[r]
+            train_questions.append(np.array(ques_file[q_id], dtype = np.float32))
+            # image
+            img_id = q_id[:len(q_id) - 3]
+            train_images.append(np.array(img_file[img_id], dtype = np.float32))
+            # label
+            ans_arr = [[int(x) for x in freq_ans_data[data[int(q_id)]]]]
+            train_labels.append(np.array(ans_arr, dtype = np.float32))
 
     # Convert to tensors
-    train_inputs = torch.from_numpy(np.array(train_inputs))
-    train_outputs = torch.from_numpy(np.array(train_outputs))
+    train_questions = torch.from_numpy(np.array(train_questions))
+    train_images = torch.from_numpy(np.array(train_images))
+    train_labels = torch.from_numpy(np.array(train_labels))
 
     # Training Dataset
-    train_ds = TensorDataset(train_inputs, train_outputs)
-    batch_size = 512
-    train_dl = DataLoader(train_ds, batch_size, shuffle = True)
+    train_ds = TensorDataset(train_questions, train_images, train_labels)
+    batch_size = 256
+    train_dl = DataLoader(train_ds, batch_size, shuffle = True)  #see
 
 
     loss_fn = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
-    train_graph = train_model(10, model, loss_fn, opt, train_dl)
-    
-    torch.save(model, "model.pt")
-    print("\t-----Model Saved Successfully-----")
+    train_graph = train_model(100, model, loss_fn, opt, train_dl)
 
     # save training graph in json file
-    try:
-        train_file = open('train_graph', 'wb')
-        pickle.dump(train_graph, train_file)
-        train_file.close()
-
-    except:
-        print("Unable to write training stats to file !!")
+    with open('train_graph.json', 'w') as f:
+        json.dump(train_graph, f)
+    
+    torch.save(model, "model.pt")
+    print("/t-----Model Saved Successfully-----")
